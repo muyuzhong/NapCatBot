@@ -82,10 +82,19 @@ export function connect(onMessage: (event: QQEvent, text: string) => void) {
     log('新消息入队', { group: event.group_id, user: event.user_id, text });
     onMessage(event, text);
   });
-  ws.addEventListener('error', () => log('WebSocket 连接失败'));
+  // 重连定时器同时负责"保活"：连不上时 undici 只发 error、不发 close，
+  // 若只在 close 里排重连，事件循环会因为没有待定任务而空掉，进程静默退出（exit 0）。
+  // 所以 error 和 close 走同一个重连入口，用 retry 保证只排一次。
+  let retry: ReturnType<typeof setTimeout> | undefined;
+  const scheduleReconnect = () => {
+    if (socket !== ws) return; // 已经有新连接了，这个旧 socket 的事件忽略
+    if (retry) return;
+    retry = setTimeout(() => { retry = undefined; connect(onMessage); }, 5000);
+  };
+  ws.addEventListener('error', () => { log('WebSocket 连接失败，5 秒后重连'); scheduleReconnect(); });
   ws.addEventListener('close', () => {
     for (const receipt of receipts.values()) if (receipt.socket === ws) receipt.finish(new Error('QQ 连接断开'));
     log('连接断开，5 秒后重连');
-    setTimeout(() => connect(onMessage), 5000);
+    scheduleReconnect();
   });
 }
