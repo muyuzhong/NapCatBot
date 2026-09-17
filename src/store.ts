@@ -9,15 +9,18 @@ export type Record_ =
   | { type: 'reply'; t: number; text: string }
   | { type: 'summary'; t: number; text: string; dropped: number }
   | { type: 'drop'; t: number; dropped: number }
-  | { type: 'clear'; t: number };
+  | { type: 'clear'; t: number }
+  // 意图识别判定不参与的消息：只归档留证，不进模型上下文。
+  | { type: 'skip'; t: number; prefix?: string; text: string; reason: string };
 
 export type Session = {
   key: string;
   file: string;
   messages: Message[];  // 上下文窗口，压缩后只剩最近若干条
   summary: string;      // 被压缩掉的那段历史
-  user(prefix: string, text: string): void;
+  user(prefix: string | undefined, text: string): void;
   reply(text: string): void;
+  skip(prefix: string | undefined, text: string, reason: string): void;
   summarize(text: string, drop: number): void;
   trim(keep: number): void;
   clear(): void;
@@ -26,9 +29,16 @@ export type Session = {
 const dir = process.env.SESSION_DIR || 'data/sessions';
 const pathOf = (key: string) => `${dir}/${createHash('sha1').update(key).digest('hex').slice(0, 16)}.jsonl`;
 // 群聊里发言人的标注来自 NapCat 推送的 sender（群名片优先），缺字段时退回 QQ 号。
-// 旧存档只有 uid，用 `[QQ 123]` 复原，保证老记录还能重放。
-const asMessage = (text: string, prefix?: string): Message =>
-  ({ role: 'user', content: prefix ? `[${prefix}] ${text}` : text });
+// 旧存档只有 uid，用 `[QQ 123]` 复原；批量消息自带时间与发言人，重复的前缀会被去掉。
+const asMessage = (text: string, prefix?: string): Message => {
+  if (!prefix) return { role: 'user', content: text };
+  // 批量消息每行都是「时间 发言人：内容」，此时外层前缀是重复的。
+  const name = prefix.replace(/\(\d+\)$/, '');
+  const lines = text.split('\n');
+  const attributed = lines.length > 1 && lines.every(line =>
+    /^\d{2}:\d{2}:\d{2} /.test(line) && (line.includes(`${prefix}：`) || line.includes(`${name}：`)));
+  return { role: 'user', content: attributed ? text : `[${prefix}] ${text}` };
+};
 
 // 打开会话：重放 JSONL 恢复上下文，之后每条记录都追加到文件尾。
 export function openSession(key: string): Session {
@@ -44,6 +54,9 @@ export function openSession(key: string): Session {
     reply(text) {
       append({ type: 'reply', t: Date.now(), text });
       session.messages.push({ role: 'assistant', content: text });
+    },
+    skip(prefix, text, reason) {
+      append({ type: 'skip', t: Date.now(), prefix, text, reason });
     },
     summarize(text, drop) {
       append({ type: 'summary', t: Date.now(), text, dropped: drop });
