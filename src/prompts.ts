@@ -23,7 +23,8 @@ export const prompts = {
   decide: (vars: Record<string, string>) => load('decide.txt', [
     '判断群聊机器人要不要参与这轮对话，只回答要不要回，不要写回复内容。',
     '最近的群聊：\n{{history}}\n当前这批消息：\n{{messages}}',
-    '只输出一行 JSON：{"reply":true 或 false,"reason":"不超过20字"}',
+    '这批里只要有一条值得接就回 true，一条都没有回 false。',
+    '只输出一个词：true 或 false。',
   ].join('\n'), vars),
   summary: (vars: Record<string, string>) => load('summary.txt', [
     '把下面这段较早的聊天记录压缩成一段中文摘要。',

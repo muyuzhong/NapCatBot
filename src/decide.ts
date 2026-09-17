@@ -1,16 +1,38 @@
 // 意图识别：先走便宜规则，模糊情况才问 Flash 要不要参与。它只做"要不要回"，不负责回答。
 import { log } from './logger.ts';
 import { prompts } from './prompts.ts';
+import { batchSegments, formatBatch, type BatchMessage } from './batch.ts';
 
 export type Decision = { reply: boolean; reason: string; source: 'rule' | 'flash' };
 export type RuleInput = {
   selfId: string;                       // 机器人自己的 QQ 号
   isGroup: boolean;
   text: string;                         // 已解析的消息文本（@ 会变成 @QQ号）
-  segments: { type: string; data?: Record<string, any> }[];
+  segments: { type: string; data?: Record<string, any> }[];  // 整批每一行的消息段
   participants: string[];               // 本批都有谁在说话
   history: { me: boolean; prefix: string; text: string }[];
 };
+
+/** 触发一批消息的事件：只用来定位回复目标（该批最新的一条）。 */
+export type BatchEvent = {
+  self_id?: number; message_type?: string; group_id?: number; user_id?: number;
+  message?: { type: string; data?: Record<string, any> }[];
+};
+
+/**
+ * 一批消息 → 判断输入。规则必须看**整批**：这批里任何一行 @了我、引用了我，都算在跟我说话；
+ * 只看触发事件（最新那条）会把前面几行的 @ 和引用漏掉。
+ */
+export function batchRuleInput(event: BatchEvent, batch: BatchMessage[], history: RuleInput['history']): RuleInput {
+  return {
+    selfId: String(event.self_id),
+    isGroup: event.message_type === 'group',
+    text: formatBatch(batch),
+    segments: batchSegments(batch),
+    participants: [...new Set(batch.map(m => m.uid))],
+    history,
+  };
+}
 
 const env = process.env;
 const num = (value: string | undefined, fallback: number) => {
@@ -23,8 +45,9 @@ const historySize = num(env.INTENT_HISTORY, 6);
 const judgeTimeoutMs = num(env.LLM_DECIDE_TIMEOUT_MS, 10_000);
 
 const isQuestion = (text: string) => /[?？]|[吗呢吧]\s*$/.test(text.trim());
-const replyId = (segments: { type: string; data?: Record<string, any> }[]) =>
-  segments.find(s => s.type === 'reply')?.data?.id;
+// 一批里可能有好几行引用（不同人引用不同消息），全收集起来，任一条引用到机器人都算。
+const replyIds = (segments: { type: string; data?: Record<string, any> }[]) =>
+  segments.filter(s => s.type === 'reply' && s.data?.id !== undefined).map(s => s.data!.id);
 
 export type Tracker = {
   /** 记录机器人刚发出的回复，供"引用我"和"回答我的提问"判断。 */
@@ -49,12 +72,12 @@ export function createTracker(): Tracker {
       return names.some(n => record.targets.includes(n) || record.targets.includes('@全体成员'));
     },
     isReplyToBot(chatKey, segments) {
-      const id = replyId(segments);
+      const ids = replyIds(segments);
       const record = last.get(chatKey);
-      if (!record) return false;
-      if (id !== undefined && record.id !== undefined) return String(id) === String(record.id);
+      if (!record || !ids.length) return false;
+      if (record.id !== undefined) return ids.some(id => String(id) === String(record.id));
       // 适配器没给消息 ID 时：只认"引用 + 时间窗内机器人刚回过"这种弱信号。
-      return id !== undefined && Date.now() - record.at <= answerWindowMs;
+      return Date.now() - record.at <= answerWindowMs;
     },
     awaitingAnswer(chatKey, participants) {
       const record = last.get(chatKey);
