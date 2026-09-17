@@ -1,6 +1,6 @@
 // 离线功能检查：不访问模型或 QQ，不引入测试框架。
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,7 +12,12 @@ process.env.LLM_CONTEXT_TOKENS = '1280';
 process.env.LLM_MAX_OUTPUT_TOKENS = '256';
 process.env.LLM_COMPRESS_AT = '0.8';
 process.env.LLM_SUMMARY_TURNS = '4';
-process.env.AGENT_PROMPT = '检查用提示词';
+// 提示词从文件读，代码里不该有措辞。
+const promptsDir = mkdtempSync(join(tmpdir(), 'qqbot-prompts-'));
+process.env.PROMPTS_DIR = promptsDir;
+writeFileSync(join(promptsDir, 'system.txt'), '检查用提示词');
+writeFileSync(join(promptsDir, 'decide.txt'), '历史：{{history}}\n当前：{{messages}}\n只输出 true 或 false');
+writeFileSync(join(promptsDir, 'summary.txt'), '压缩这段：\n{{history}}');
 process.env.BATCH_PRIVATE_MS = '2500';
 process.env.BATCH_GROUP_MS = '5000';
 process.env.BATCH_MAX_WAIT_MS = '10000';
@@ -22,6 +27,7 @@ const { chatLoop, estimateSize, trimContext } = await import('./src/agent.ts');
 const { openSession } = await import('./src/store.ts');
 const { readableText } = await import('./src/napcat.ts');
 const { batchDefaults, createBatcher, formatBatch, sessionKey } = await import('./src/batch.ts');
+const { prompts } = await import('./src/prompts.ts');
 const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt } = await import('./src/decide.ts');
 
 const summaryMark = '【摘要】前面在聊测试。';
@@ -168,7 +174,7 @@ for (let i = 0; i < 12; i++) {
   long.reply('收到');
 }
 // 预算 1280-256=1024，阈值 80% = 819
-assert.ok(estimateSize([{ role: 'system', content: process.env.AGENT_PROMPT }, ...long.messages]) > 819, '应已超过压缩阈值');
+assert.ok(estimateSize([{ role: 'system', content: prompts.system }, ...long.messages]) > 819, '应已超过压缩阈值');
 let summarizeCalls = 0;
 const summarize = dropped => { summarizeCalls++; assert.ok(dropped.length > 0); return Promise.resolve(summaryMark); };
 const started = [];
@@ -237,9 +243,9 @@ const decided = await shouldReply({ ...base, history: [{ me: false, prefix: '小
 assert.equal(decided.reply, true);
 assert.equal(decided.source, 'flash');
 assert.equal(decideCalls[0].model, 'mock-flash', '应调用判断模型而不是主模型');
-assert.ok(decideCalls[0].prompt.includes('最近的群聊'), '判断提示词应带上最近群聊');
+assert.ok(decideCalls[0].prompt.startsWith('历史：'), '判断提示词应来自 prompts/decide.txt');
 assert.ok(decideCalls[0].prompt.includes('小明(1)：这机器人谁写的'), '应带上历史发言人');
-assert.ok(decideCalls[0].prompt.includes('只输出一个词'), '应要求只输出一个词');
+assert.ok(/只输出 true 或 false/.test(decideCalls[0].prompt), '应要求只输出 true/false');
 // 判断模型挂了 → 不参与，不能卡住
 globalThis.fetch = async () => new Response('boom', { status: 500 });
 const failed = await shouldReply(base, createTracker(), '9');
