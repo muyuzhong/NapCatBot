@@ -25,7 +25,7 @@ LLM_CONTEXT_TOKENS=8192
 LLM_MAX_OUTPUT_TOKENS=1024
 LLM_SUMMARY_TURNS=8
 PROMPTS_DIR=prompts
-LLM_EMBED_MODEL=doubao-embed     # 不配也能跑：只跳过事件记忆的向量检索
+LLM_EMBED_MODEL=doubao-embedding-vision-250328   # 不配也能跑：只跳过事件记忆的向量检索
 MEMORY_ENABLED=1
 MEMORY_DIR=data/memory
 ONEBOT_WS_URL=ws://127.0.0.1:3001
@@ -121,7 +121,7 @@ npm start
 
 **读取要保守**，否则召回"正确"的旧信息反而把话题带偏。所以先过 Memory Gate（规则版）："我过了"、"上次那个怎么样了"、"你还记得之前那个人吗"、"老王是不是也干过这个"这类明显在接前文的才去查；"哈哈哈哈"、"好困"、"吃饭了吗"不查。命中后注入 `prompts/memory-inject.txt` 渲染的 system 消息，**只作用于本轮请求，不写进会话存档**。
 
-`LLM_EMBED_MODEL` 不配也不影响使用：画像仍按精确过滤工作，只是事件检索自动跳过（宁可没有往事，也不要塞不相关的）。火山方舟 coding plan 填 `doubao-embed`，标准方舟可用 `doubao-embedding-text-240715` 之类；向量维度按第一次写入自动适配，**换 embedding 模型要清空 `MEMORY_DIR` 重建**。
+`LLM_EMBED_MODEL` 不配也不影响使用：画像仍按精确过滤工作，只是事件检索自动跳过（宁可没有往事，也不要塞不相关的）。**实测**：火山方舟 coding plan 端点（`.../api/coding/v3`）只认 `doubao-embedding-vision-250328`（2048 维），`doubao-embed`、`doubao-embedding-text-240715` 都会返回 `UnsupportedModel`；标准方舟端点则可用 `doubao-embedding-text-240715` 之类。向量维度按第一次写入自动适配，**换 embedding 模型要清空 `MEMORY_DIR` 重建**。
 
 还没做（第一版刻意不做）：遗忘曲线、复杂评分、知识图谱、自动反思。
 
