@@ -7,5 +7,8 @@
   },
   "scripts": {
     "start": "node --env-file=.env bot.ts"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.38.0"
   }
 }

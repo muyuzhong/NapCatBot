@@ -31,4 +31,17 @@ export const prompts = {
     '保留说话人、约定、关键结论与未结束的话题；控制在 200 字以内。',
     '\n{{history}}',
   ].join('\n'), vars),
+  memoryExtract: (vars: Record<string, string>) => load('memory-extract.txt', [
+    '从这段聊天里挑出值得长期记住的人和事，只输出 JSON：{"memories":[]}',
+    '会话范围：{{scope}}\n说话人：{{speakers}}\n聊天记录：\n{{segment}}',
+  ].join('\n'), vars),
+  memoryMerge: (vars: Record<string, string>) => load('memory-merge.txt', [
+    '对每条候选决定 ADD / UPDATE / IGNORE，只输出 JSON：{"ops":[]}',
+    '已有记忆：\n{{existing}}\n新候选：\n{{candidates}}',
+  ].join('\n'), vars),
+  memoryInject: (vars: Record<string, string>) => load('memory-inject.txt', [
+    '[长期记忆] 下面是你本来就知道的背景，不是新消息；只在相关时自然使用，不要复述。',
+    '{{profiles}}',
+    '{{events}}',
+  ].join('\n'), vars),
 };

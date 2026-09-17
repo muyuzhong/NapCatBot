@@ -1,6 +1,6 @@
 # QQbot
 
-单 QQ、单 Agent，使用 TypeScript 和 Node.js 原生 fetch / WebSocket。无 SDK、无第三方依赖。
+单 QQ、单 Agent，使用 TypeScript 和 Node.js 原生 fetch / WebSocket。除了长期记忆用的 LanceDB，没有别的第三方依赖。
 
 ## 文件结构
 
@@ -25,14 +25,18 @@ LLM_CONTEXT_TOKENS=8192
 LLM_MAX_OUTPUT_TOKENS=1024
 LLM_SUMMARY_TURNS=8
 PROMPTS_DIR=prompts
+LLM_EMBED_MODEL=doubao-embedding-vision-250328   # 不配也能跑：只跳过事件记忆的向量检索
+MEMORY_ENABLED=1
+MEMORY_DIR=data/memory
 ONEBOT_WS_URL=ws://127.0.0.1:3001
 ONEBOT_TOKEN=接口口令
 ```
 
-提示词都在 `prompts/` 下的纯文本文件里，代码只负责读取和填空；每次调用前重新读盘，**改完不用重启**，下一条消息就生效。目录用 `PROMPTS_DIR` 指定（默认 `prompts`）：`system.txt` 人格设定、`decide.txt` 参与判断（`{{history}}`/`{{messages}}`）、`summary.txt` 压缩摘要（`{{history}}`）。文件缺失或为空时用内建兜底并记日志。旧的 `AGENT_PROMPT` / `AGENT_PROMPT_1` 不再读取；旧的第二、第三账号及讨论轮数配置也不再使用，其数据目录不删除。
+提示词都在 `prompts/` 下的纯文本文件里，代码只负责读取和填空；每次调用前重新读盘，**改完不用重启**，下一条消息就生效。目录用 `PROMPTS_DIR` 指定（默认 `prompts`）：`system.txt` 人格设定、`decide.txt` 参与判断（`{{history}}`/`{{messages}}`）、`summary.txt` 压缩摘要（`{{history}}`）、`memory-extract.txt` / `memory-merge.txt` / `memory-inject.txt` 长期记忆的提取、合并与注入。文件缺失或为空时用内建兜底并记日志。旧的 `AGENT_PROMPT` / `AGENT_PROMPT_1` 不再读取；旧的第二、第三账号及讨论轮数配置也不再使用，其数据目录不删除。
 
 ```bash
 sudo docker compose up -d napcat
+npm install          # 长期记忆用到 LanceDB，会装原生二进制
 npm start
 ```
 
@@ -82,6 +86,44 @@ npm start
 日志同时写入终端与 `data/bot.log`，包含输入、模型输出、实际返回的 reasoning 字段及 QQ 回执。模型请求是非流式，完整响应到达后才显示思考和输出；无法展示接口未提供的内部过程。
 
 > `LLM_CONTEXT_TOKENS` 按 UTF-8 字节估算，1M 字节约合 40 万 token 中文，所以填 1M 时窗口利用是保守的。这个值要和模型服务端实际开放的上下文一致。
+
+## 长期记忆
+
+三层记忆，各管各的：**短期会话记忆**（上面的 JSONL，管当前话题）→ **画像记忆**（人和群的长期情况，精确过滤读取）→ **事件记忆**（以前发生过什么，LanceDB 向量检索）。第一版只做四件事：记住人、记住重要事件、能更新旧记忆、只在需要时回忆。
+
+存储用 LanceDB（`@lancedb/lancedb`，项目唯一的生产依赖），两张表都放在 `MEMORY_DIR`（默认 `data/memory`）：
+
+| 表 | 内容 | 读取方式 |
+|---|---|---|
+| `profiles` | 某个人的身份、兴趣、长期状态、稳定关系，以及群的固定梗 | 按 `group_id` + `user_id` + `type` **精确过滤**，不做向量检索 |
+| `events` | 发生过/将要发生的事，带 `importance` / `confidence` / `source_message_ids` | 按 embedding 做向量检索，阈值过滤后最多取 `MEMORY_RECALL_EVENTS`（默认 2）条 |
+
+记忆按会话隔离：`group_id` 存的是会话 key（`group:<群号>` / `private:<QQ号>`），一个群学到的画像不会漏到别的群。
+
+**写入不是"来一条消息就 embedding"**，而是等一段聊天安静下来（`MEMORY_IDLE_MS`，默认 3 分钟）：
+
+```
+一段聊天结束 → Flash 提取候选 → 找已有相关记忆 → ADD / UPDATE / IGNORE → 写 LanceDB
+```
+
+- 库里没有任何相关记忆时直接 ADD，不再多问一次模型；有相关记忆才让它决定怎么合并。
+- 信息变了要 UPDATE 旧条目而不是堆新的：已在准备考公 + "我不考公了，开始找后端工作" → 画像改成"当前主要方向：后端求职"。旧状态本身发生过，提取提示词允许另外 ADD 一条事件。
+- 决策解析失败时兜底按 ADD 处理：宁可多记一条，也不要悄悄丢信息。
+
+**证据强度**决定一条候选能去哪（群聊里别人说的话不能当本人画像）：
+
+| evidence | 去向 |
+|---|---|
+| `self_statement` 本人陈述 | 可写画像，高可信 |
+| `observed_event` 明确发生 | 可写事件 |
+| `third_party_claim` 第三方描述 | **不能改画像**，自动降级成 `claim` 事件，可信度打折 |
+| `inference` 模型推断 | 直接丢弃，不进长期事实 |
+
+**读取要保守**，否则召回"正确"的旧信息反而把话题带偏。所以先过 Memory Gate（规则版）："我过了"、"上次那个怎么样了"、"你还记得之前那个人吗"、"老王是不是也干过这个"这类明显在接前文的才去查；"哈哈哈哈"、"好困"、"吃饭了吗"不查。命中后注入 `prompts/memory-inject.txt` 渲染的 system 消息，**只作用于本轮请求，不写进会话存档**。
+
+`LLM_EMBED_MODEL` 不配也不影响使用：画像仍按精确过滤工作，只是事件检索自动跳过（宁可没有往事，也不要塞不相关的）。**实测**：火山方舟 coding plan 端点（`.../api/coding/v3`）只认 `doubao-embedding-vision-250328`（2048 维），`doubao-embed`、`doubao-embedding-text-240715` 都会返回 `UnsupportedModel`；标准方舟端点则可用 `doubao-embedding-text-240715` 之类。向量维度按第一次写入自动适配，**换 embedding 模型要清空 `MEMORY_DIR` 重建**。
+
+还没做（第一版刻意不做）：遗忘曲线、复杂评分、知识图谱、自动反思。
 
 ## 本地检查
 
