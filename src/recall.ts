@@ -52,8 +52,9 @@ const formatProfiles = (rows: ProfileRow[]) => {
   return [...byUser.values()].map(({ name, facts }) => `- ${name}：${facts.join('；')}`).join('\n');
 };
 
+// 方括号里是"这条是什么时候记下来的"，不是事件发生的时间：事件本身的时间表达留在 content 里（周五、国庆…）。
 const formatEvents = (rows: EventHit[]) => rows
-  .map(row => `- ${new Date(row.created_at).toISOString().slice(0, 10)} ${row.content}`)
+  .map(row => `- [${new Date(row.created_at).toISOString().slice(0, 10)}] ${row.content}`)
   .join('\n');
 
 /**

@@ -31,6 +31,8 @@ const memoryDir = mkdtempSync(join(tmpdir(), 'qqbot-memory-'));
 process.env.MEMORY_DIR = memoryDir;
 process.env.MEMORY_ENABLED = '1';
 process.env.LLM_EMBED_MODEL = 'mock-embed';
+// 检查里让"相关记忆"的判定宽松一点，事件检索的阈值由用例显式传参控制。
+process.env.MEMORY_MAX_DISTANCE = '1';
 
 const { chatLoop, estimateSize, trimContext } = await import('./src/agent.ts');
 const { openSession } = await import('./src/store.ts');
@@ -40,7 +42,7 @@ const { prompts } = await import('./src/prompts.ts');
 const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt, batchRuleInput } = await import('./src/decide.ts');
 const { memoryStats, addEvents, searchEvents, listProfiles } = await import('./src/memory.ts');
 const { needMemory, recall } = await import('./src/recall.ts');
-const { parseCandidates, applyEvidenceRules, parseOps, rememberSegment, buildRememberInput } = await import('./src/remember.ts');
+const { parseCandidates, applyEvidenceRules, parseOps, rememberSegment, buildRememberInput, createMemoryQueue } = await import('./src/remember.ts');
 
 const summaryMark = '【摘要】前面在聊测试。';
 const requests = [];
@@ -451,4 +453,38 @@ for (const [file, placeholders] of [
   for (const placeholder of placeholders) assert.ok(text.includes(placeholder), `${file} 要保留 ${placeholder}`);
 }
 
-console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级/混合批次按整批判断)、长期记忆(Gate/证据强度/ADD/UPDATE/IGNORE/精确过滤/阈值/注入隔离)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
+// 10.11 队列：提取成功后必须消费掉记录。旧实现拿数组长度当游标，缓冲区塞满后"新消息数"永远是 0，提取永久停摆。
+const queue = createMemoryQueue(3);            // 上限 6 条
+for (let i = 1; i <= 6; i++) queue.push('k', `m${i}`);
+assert.equal(queue.peek('k', 2).length, 6, '够条数就该能提取');
+assert.equal(queue.peek('k', 7).length, 0, '不够 min 条不提');
+queue.consume('k', 6);
+assert.equal(queue.size('k'), 0, '提取成功后要消费掉');
+queue.push('k', 'm7');
+queue.push('k', 'm8');
+assert.equal(queue.peek('k', 2).length, 2, '消费之后新消息必须还能触发提取（旧实现在这里永远是 0）');
+for (let i = 0; i < 10; i++) queue.push('k', `x${i}`);
+assert.equal(queue.size('k'), 6, '缓冲区要有上限，不能无限涨');
+
+// 10.12 事件 UPDATE：要真的改到 events 表，而且向量跟着内容一起换（profiles 表存在时最容易静默失败）
+extractReply = { memories: [{ target: 'event', subject: '张三', subject_id: '10001', type: 'event', content: '张三 9 月 15 日要面字节', evidence: 'self_statement', importance: 0.9, confidence: 0.9 }] };
+mergeReply = () => ({ ops: [{ op: 'ADD', candidate: 0 }] }); // 库里已有别的事件，这一步走合并分支
+const seededEvent = await rememberSegment({ scope: 'group:9', segment: '17:00:00 张三(10001)：9 月 15 日要面字节', speakers: [{ id: '10001', name: '张三' }], sourceIds: '140', participants: ['10001'] });
+assert.equal(seededEvent.added, 1, '先写一条事件');
+const before = (await searchEvents(toyVector('张三 9 月 15 日要面字节'), { scope: 'group:9', maxDistance: 0.01 }))[0];
+assert.ok(before, '新事件应该能按向量搜到');
+extractReply = { memories: [{ target: 'event', subject: '张三', subject_id: '10001', type: 'event', content: '张三字节一面通过了', evidence: 'self_statement', importance: 0.9, confidence: 0.9 }] };
+mergeReply = () => ({ ops: [{ op: 'UPDATE', candidate: 0, existing_id: before.id, content: '张三字节一面通过了' }] });
+const changedEvent = await rememberSegment({ scope: 'group:9', segment: '17:30:00 张三(10001)：字节一面过了', speakers: [{ id: '10001', name: '张三' }], sourceIds: '141', participants: ['10001'] });
+assert.equal(changedEvent.updated, 1, '事件 UPDATE 必须落地');
+assert.equal(changedEvent.added, 0, 'UPDATE 不该再多写一条');
+assert.ok((await searchEvents(toyVector('张三字节一面通过了'), { scope: 'group:9', maxDistance: 0.01 })).some(row => row.id === before.id), '内容改了向量也要跟着改，否则搜到的还是旧语义');
+assert.equal((await searchEvents(toyVector('张三 9 月 15 日要面字节'), { scope: 'group:9', maxDistance: 0.01 })).filter(row => row.id === before.id).length, 0, '旧向量不该再命中');
+
+// 10.13 UPDATE 只能改这次真正检索出来的记忆，凭空给的 id 直接拒绝
+mergeReply = () => ({ ops: [{ op: 'UPDATE', candidate: 0, existing_id: '00000000-0000-0000-0000-000000000000', content: '凭空改写' }] });
+extractReply = { memories: [{ target: 'event', subject: '张三', subject_id: '10001', type: 'event', content: '张三又去面试了', evidence: 'self_statement', importance: 0.8, confidence: 0.8 }] };
+const bogus = await rememberSegment({ scope: 'group:9', segment: '18:00:00 张三(10001)：又去面了一家', speakers: [{ id: '10001', name: '张三' }], sourceIds: '142', participants: ['10001'] });
+assert.ok(bogus.dropped.some(text => text.includes('UPDATE 目标不在候选里')), '凭空给的 id 要被拒绝');
+
+console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级/混合批次按整批判断)、长期记忆(Gate/证据强度/ADD/UPDATE/IGNORE/精确过滤/阈值/注入隔离/队列消费/事件向量更新)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');

@@ -146,6 +146,34 @@ const eventRow = (candidate: Candidate, input: RememberInput, embedding: number[
   created_at: now(), updated_at: now(), source_message_ids: input.sourceIds, embedding,
 });
 
+/**
+ * 待提取的聊天记录缓冲。
+ * 不能用"数组长度"当游标：缓冲区有上限，塞满之后长度不再增长，
+ * 那样算出来的"新消息数"永远是 0，提取会永久停摆。所以处理完必须把已处理的消费掉。
+ */
+export function createMemoryQueue(limit: number) {
+  const cap = Math.max(2, limit) * 2;
+  const buffers = new Map<string, string[]>();
+  return {
+    push(key: string, entry: string) {
+      if (!entry.trim()) return;
+      const entries = buffers.get(key) ?? [];
+      entries.push(entry);
+      buffers.set(key, entries.slice(-cap)); // 只保留最近这些，内存有上限
+    },
+    /** 当前待提取的记录（副本）；不足 min 条说明这段还没什么可记的。 */
+    peek(key: string, min: number): string[] {
+      const entries = buffers.get(key) ?? [];
+      return entries.length >= min ? [...entries] : [];
+    },
+    /** 提取成功后消费掉已处理的部分；失败时不要调用，留着下次重试。 */
+    consume(key: string, count: number) {
+      buffers.set(key, (buffers.get(key) ?? []).slice(count));
+    },
+    size: (key: string) => buffers.get(key)?.length ?? 0,
+  };
+}
+
 export type RememberResult = { added: number; updated: number; ignored: number; dropped: string[]; reason?: string };
 
 /**
@@ -193,7 +221,7 @@ export async function rememberSegment(input: RememberInput): Promise<RememberRes
   const related = await Promise.all(kept.map(candidate => relatedTo(candidate, input.scope, vectors.get(candidate))));
 
   const additions: { candidate: Candidate; vector: number[] | null }[] = [];
-  const updates: { id: string; content?: string; importance?: number; confidence?: number }[] = [];
+  const updates: { id: string; kind: 'profile' | 'event'; content?: string; importance?: number; confidence?: number }[] = [];
   let ignored = 0;
 
   const hasRelated = related.some(({ profiles, events }) => profiles.length || events.length);
@@ -201,8 +229,14 @@ export async function rememberSegment(input: RememberInput): Promise<RememberRes
     // 库里没有任何相关记忆，不需要再问一次模型，直接 ADD。
     for (const candidate of kept) additions.push({ candidate, vector: vectors.get(candidate) ?? null });
   } else {
+    // 记住每条已有记忆属于哪张表：UPDATE 必须打到对应那张表，不能靠"先试 profile 再试 event"。
+    const existing = related.flatMap(({ profiles, events }) => [
+      ...profiles.map(row => ({ row, kind: 'profile' as const })),
+      ...events.map(row => ({ row, kind: 'event' as const })),
+    ]);
+    const kindById = new Map(existing.map(({ row, kind }) => [row.id, kind]));
     const ops = parseOps(await ask(prompts.memoryMerge({
-      existing: formatExisting(related.flatMap(({ profiles, events }) => [...profiles.map(p => ({ ...p, kind: 'profile' })), ...events.map(e => ({ ...e, kind: 'event' }))])),
+      existing: formatExisting(existing),
       candidates: kept.map((candidate, index) => `[${index}] ${candidate.target} ${candidate.subject}(${candidate.subject_id}) ${candidate.type}：${candidate.content}（证据 ${candidate.evidence}，重要度 ${candidate.importance}）`).join('\n'),
     })));
     if (!ops) {
@@ -212,8 +246,12 @@ export async function rememberSegment(input: RememberInput): Promise<RememberRes
       for (const op of ops) {
         const candidate = typeof op.candidate === 'number' && !Number.isNaN(op.candidate) ? kept[op.candidate] : undefined;
         if (op.op === 'ADD' && candidate) additions.push({ candidate, vector: vectors.get(candidate) ?? null });
-        else if (op.op === 'UPDATE' && op.existing_id) updates.push({ id: op.existing_id, content: op.content, importance: op.importance, confidence: op.confidence });
-        else ignored++;
+        else if (op.op === 'UPDATE') {
+          const kind = op.existing_id ? kindById.get(op.existing_id) : undefined;
+          // 只允许更新这次真正检索出来的记忆；凭空给的 id（或跨类型改写）一律拒绝。
+          if (!kind) { ignored++; dropped.push(`UPDATE 目标不在候选里，已忽略：${String(op.existing_id).slice(0, 8)}`); }
+          else updates.push({ id: op.existing_id!, kind, content: op.content, importance: op.importance, confidence: op.confidence });
+        } else ignored++;
       }
       // 模型漏掉的候选补成 ADD：提取到了却没落地，比多记一条更糟。
       const covered = new Set(ops.map(op => op.candidate).filter(index => typeof index === 'number'));
@@ -232,23 +270,29 @@ export async function rememberSegment(input: RememberInput): Promise<RememberRes
   }
   for (const change of updates) {
     const values: Record<string, any> = { updated_at: now(), source_message_ids: input.sourceIds };
+    // 事件的向量必须跟着内容一起换，否则会出现"记录是 A、搜出来还是 B"。
+    if (change.kind === 'event' && change.content) {
+      const vector = embedConfigured() ? await embed(change.content) : null;
+      if (!vector) { dropped.push(`事件内容要改但拿不到新向量，本次不改：${change.content.slice(0, 20)}`); continue; }
+      values.embedding = vector;
+    }
     if (change.content) values.content = change.content;
     if (change.importance !== undefined) values.importance = clamp(change.importance, 0.6);
     if (change.confidence !== undefined) values.confidence = clamp(change.confidence, 0.6);
-    const done = await updateProfile(change.id, values) || await updateEvent(change.id, values);
+    const done = change.kind === 'profile' ? await updateProfile(change.id, values) : await updateEvent(change.id, values);
     if (done) updated++;
   }
   return { added, updated, ignored, dropped };
 }
 
-function formatExisting(rows: any[]): string {
-  if (!rows.length) return '（无）';
+function formatExisting(entries: { row: any; kind: 'profile' | 'event' }[]): string {
+  if (!entries.length) return '（无）';
   const seen = new Set<string>();
   const lines: string[] = [];
-  for (const row of rows) {
+  for (const { row, kind } of entries) {
     if (seen.has(row.id)) continue;
     seen.add(row.id);
-    lines.push(row.kind === 'profile'
+    lines.push(kind === 'profile'
       ? `[${row.id}] profile ${row.user_name || ''}(${row.user_id}) ${row.type}：${row.content}（证据 ${row.evidence}）`
       : `[${row.id}] event ${row.content}（证据 ${row.evidence}）`);
   }

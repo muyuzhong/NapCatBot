@@ -4,7 +4,7 @@ import { connect, sendReply, type QQEvent } from './src/napcat.ts';
 import { createBatcher, sessionKey, type BatchMessage } from './src/batch.ts';
 import { batchRuleInput, createTracker, shouldReply } from './src/decide.ts';
 import { recall } from './src/recall.ts';
-import { buildRememberInput, rememberSegment } from './src/remember.ts';
+import { buildRememberInput, createMemoryQueue, rememberSegment } from './src/remember.ts';
 import { memoryStats } from './src/memory.ts';
 import { log } from './src/logger.ts';
 
@@ -44,15 +44,8 @@ const memoryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const memoryRefs = new Map<string, { mid?: number; uid: string; name: string }[]>();
 // 这段聊天攒下的记录：群友说的话（哪怕我们没参与）+ 我们自己的回复。
 // 不能只从会话上下文取——没参与的消息不进上下文，那样"群里聊过什么"就永远记不住。
-const memoryLog = new Map<string, string[]>();
-const rememberedThrough = new Map<string, number>();
-
-function appendMemoryLog(key: string, entry: string) {
-  if (!entry.trim()) return;
-  const entries = memoryLog.get(key) ?? [];
-  entries.push(entry);
-  memoryLog.set(key, entries.slice(-memorySegmentMessages * 2));
-}
+// 提取成功后由队列消费掉；缓冲区有上限，不能拿数组长度当游标（那样塞满之后就永远认为没有新消息）。
+const memoryQueue = createMemoryQueue(memorySegmentMessages);
 
 function scheduleRemember(key: string) {
   if (process.env.MEMORY_ENABLED === '0') return;
@@ -65,11 +58,11 @@ function scheduleRemember(key: string) {
 
 /** 把最近一段对话交给记忆提取：谁说的、说了什么、对应的 QQ 消息 ID。 */
 async function rememberNow(key: string) {
-  const entries = memoryLog.get(key) ?? [];
-  if (entries.length - (rememberedThrough.get(key) ?? 0) < memoryMinMessages) return;
+  const entries = memoryQueue.peek(key, memoryMinMessages);
+  if (!entries.length) return;
   const input = buildRememberInput(key, entries, (memoryRefs.get(key) ?? []).slice(-memorySegmentMessages), memorySegmentMessages);
   const result = await rememberSegment(input);
-  rememberedThrough.set(key, entries.length);
+  memoryQueue.consume(key, entries.length); // 提取成功才消费；失败留着下次重试
   log('记忆提取', { key, added: result.added, updated: result.updated, ignored: result.ignored, reason: result.reason, dropped: result.dropped.slice(0, 3) });
 }
 
@@ -90,7 +83,7 @@ async function handleBatch(key: string, batch: BatchMessage[]) {
     if (!decision.reply) {
       log('不参与', { key, reason: decision.reason, source: decision.source });
       session.skip(undefined, text, `${decision.source}:${decision.reason}`);
-      appendMemoryLog(key, text); // 我们没参与，但这段照样可能值得长期记
+      memoryQueue.push(key, text); // 我们没参与，但这段照样可能值得长期记
       return;
     }
     log('参与', { key, reason: decision.reason, source: decision.source });
@@ -102,7 +95,7 @@ async function handleBatch(key: string, batch: BatchMessage[]) {
     });
     // 整批当成一条 user 消息；每行已带时间和发言人，不再套外层前缀。
     session.user(undefined, text);
-    appendMemoryLog(key, text);
+    memoryQueue.push(key, text);
     const iterator = chatLoop(session, { memory: memory?.text });
     let result = await iterator.next();
     let messageId: number | undefined;
@@ -114,7 +107,7 @@ async function handleBatch(key: string, batch: BatchMessage[]) {
     }
     if (result.value?.reply) {
       session.reply(result.value.reply);
-      appendMemoryLog(key, `我：${result.value.reply}`);
+      memoryQueue.push(key, `我：${result.value.reply}`);
       // 记下"我说过什么、对谁说的"，用于后续的引用与追问判断。
       const mentioned = [...result.value.reply.matchAll(/@(\d{5,})/g)].map(m => m[1]);
       tracker.sent(chatKey, messageId, result.value.reply, '我自己', mentioned.length ? mentioned : input.participants);
