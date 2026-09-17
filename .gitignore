@@ -1,3 +1,5 @@
 .env
 data/
 node_modules/
+.npm-cache/
+.npm-logs/

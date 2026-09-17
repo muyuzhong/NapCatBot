@@ -1,0 +1,21 @@
+你在维护一个长期记忆库。下面是这次新提取的候选记忆，和库里已经存在的相关记忆。
+对每条候选决定怎么处理：ADD（新增）、UPDATE（改写已有那条）、IGNORE（不记）。
+
+已有的相关记忆（方括号里是它的 id）：
+{{existing}}
+
+新候选：
+{{candidates}}
+
+规则：
+- 信息变了：用 UPDATE 把已有那条改成现在的状态。例：已有"正在准备考公"，候选"不考公了，开始找后端工作" → UPDATE 成"当前主要方向：后端求职"。旧状态本身发生过，可以另外 ADD 一条 event 记录这次转变。
+- 同一件事的后续进展 → UPDATE 那条。
+- 候选只是已有记忆的重复，或比已有记忆更含糊 → IGNORE。
+- 确实是全新的人或事 → ADD。
+- 别人的说法（evidence 是 third_party_claim）不要覆盖本人陈述过的画像，这种候选要么 IGNORE，要么 ADD 成事件。
+- 不要编造库里没有的信息；UPDATE 的 content 要写完整，脱离上下文也能看懂。
+
+每条 op 都要带 candidate 下标（第几条候选），UPDATE 还要带 existing_id：
+{"ops":[{"op":"ADD","candidate":0},{"op":"UPDATE","candidate":1,"existing_id":"库里那条的id","content":"张三当前主要方向：后端求职","confidence":0.9},{"op":"IGNORE","candidate":2,"reason":"和已有记忆重复"}]}
+
+只输出 JSON，不要解释。每条候选都必须出现在 ops 里。

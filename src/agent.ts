@@ -55,10 +55,12 @@ async function compress(session: Session, threshold: number, summarize: typeof s
   session.summarize(summary, dropped.length);
 }
 
-function buildMessages(session: Session): Message[] {
+function buildMessages(session: Session, memory?: string): Message[] {
   return [
     system(),
     ...(session.summary ? [{ role: 'system' as const, content: `[前情摘要] ${session.summary}` }] : []),
+    // 长期记忆按轮注入，不落存档：它是背景知识，不是这段对话说过的话。
+    ...(memory ? [{ role: 'system' as const, content: memory }] : []),
     ...session.messages,
   ];
 }
@@ -89,16 +91,17 @@ async function summarizeHistory(dropped: Message[]): Promise<string | undefined>
 // 一轮对话：压缩决策在 model.started 之前完成，所以 started 里的就是最终请求体。
 export async function* chatLoop(
   session: Session,
-  onCompress: (dropped: Message[]) => Promise<string | undefined> = summarizeHistory,
+  options: { onCompress?: (dropped: Message[]) => Promise<string | undefined>; memory?: string } = {},
 ): AsyncGenerator<AgentEvent, { reply: string }> {
+  const summarize = options.onCompress ?? summarizeHistory;
   const budget = contextTokens - outputTokens;          // 能安全发送的上限
   const threshold = Math.floor(budget * compressAt);    // 到此比例开始压缩
-  if (estimateSize(buildMessages(session)) > threshold) {
+  if (estimateSize(buildMessages(session, options.memory)) > threshold) {
     // 摘要出不来时不放弃这一轮，退回纯裁剪继续回复；裁剪也装不下才抛错。
-    try { await compress(session, threshold, onCompress); }
+    try { await compress(session, threshold, summarize); }
     catch { session.trim(trimContext([system(), ...session.messages], threshold).length); }
   }
-  const messages = buildMessages(session);
+  const messages = buildMessages(session, options.memory);
   if (estimateSize(messages) > budget) throw new Error('消息超过上下文预算，请缩短消息或调大预算');
   yield { type: 'model.started', messages };
   const response = await fetch(`${env.LLM_BASE_URL!.replace(/\/$/, '')}/chat/completions`, {

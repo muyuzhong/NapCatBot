@@ -18,10 +18,19 @@ process.env.PROMPTS_DIR = promptsDir;
 writeFileSync(join(promptsDir, 'system.txt'), '检查用提示词');
 writeFileSync(join(promptsDir, 'decide.txt'), '历史：{{history}}\n当前：{{messages}}\n只输出 true 或 false');
 writeFileSync(join(promptsDir, 'summary.txt'), '压缩这段：\n{{history}}');
+// 记忆相关的提示词同样用固定文本，测的是加载与渲染，不是措辞。
+writeFileSync(join(promptsDir, 'memory-extract.txt'), 'fixture-extract\n范围：{{scope}}\n说话人：{{speakers}}\n记录：\n{{segment}}');
+writeFileSync(join(promptsDir, 'memory-merge.txt'), 'fixture-merge\n已有：\n{{existing}}\n候选：\n{{candidates}}');
+writeFileSync(join(promptsDir, 'memory-inject.txt'), '[记忆] 背景如下：\n{{profiles}}\n{{events}}');
 process.env.BATCH_PRIVATE_MS = '2500';
 process.env.BATCH_GROUP_MS = '5000';
 process.env.BATCH_MAX_WAIT_MS = '10000';
 process.env.BATCH_MAX_BATCH = '10';
+// 记忆库也写到临时目录，检查不碰 data/。
+const memoryDir = mkdtempSync(join(tmpdir(), 'qqbot-memory-'));
+process.env.MEMORY_DIR = memoryDir;
+process.env.MEMORY_ENABLED = '1';
+process.env.LLM_EMBED_MODEL = 'mock-embed';
 
 const { chatLoop, estimateSize, trimContext } = await import('./src/agent.ts');
 const { openSession } = await import('./src/store.ts');
@@ -29,6 +38,9 @@ const { readableText } = await import('./src/napcat.ts');
 const { batchDefaults, createBatcher, formatBatch, sessionKey } = await import('./src/batch.ts');
 const { prompts } = await import('./src/prompts.ts');
 const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt, batchRuleInput } = await import('./src/decide.ts');
+const { memoryStats, addEvents, searchEvents, listProfiles } = await import('./src/memory.ts');
+const { needMemory, recall } = await import('./src/recall.ts');
+const { parseCandidates, applyEvidenceRules, parseOps, rememberSegment, buildRememberInput } = await import('./src/remember.ts');
 
 const summaryMark = '【摘要】前面在聊测试。';
 const requests = [];
@@ -178,7 +190,7 @@ assert.ok(estimateSize([{ role: 'system', content: prompts.system }, ...long.mes
 let summarizeCalls = 0;
 const summarize = dropped => { summarizeCalls++; assert.ok(dropped.length > 0); return Promise.resolve(summaryMark); };
 const started = [];
-for await (const event of chatLoop(long, summarize)) if (event.type === 'model.started') started.push(event);
+for await (const event of chatLoop(long, { onCompress: summarize })) if (event.type === 'model.started') started.push(event);
 assert.equal(summarizeCalls, 1, '每轮最多压缩一次');
 assert.equal(requests.at(-1).messages[1].content, `[前情摘要] ${summaryMark}`);
 assert.ok(estimateSize(started.at(-1).messages) <= 819, '压缩后应回落到阈值以内');
@@ -299,4 +311,144 @@ failing.user('小明(2)', 'fail');
 await assert.rejects(async () => { for await (const event of chatLoop(failing)) {} }, /HTTP 500/);
 assert.equal(failing.messages.length, 1);
 
-console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级/混合批次按整批判断)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
+// 10. 长期记忆：Gate、证据强度、ADD/UPDATE/IGNORE、精确过滤、阈值、注入
+process.env.LLM_MEMORY_MODEL = 'mock-memory';
+process.env.LLM_MEMORY_URL = 'https://memory.invalid/v1';
+
+// 玩具向量：只按字符桶计数，够验证"相同的能召回、不相关的被阈值挡掉"。
+const toyVector = text => {
+  const vector = new Array(32).fill(0);
+  for (const char of String(text)) vector[(char.codePointAt(0) ?? 0) % 32] += 1;
+  const norm = Math.hypot(...vector) || 1;
+  return vector.map(value => Number((value / norm).toFixed(6)));
+};
+let extractReply = { memories: [] };
+let mergeReply = () => ({ ops: [] });
+const memoryCalls = [];
+globalThis.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  if (String(url).endsWith('/embeddings')) return Response.json({ data: [{ embedding: toyVector(body.input[0]) }] });
+  const prompt = String(body.messages?.[0]?.content ?? '');
+  if (prompt.startsWith('fixture-extract')) {
+    memoryCalls.push('extract');
+    return Response.json({ choices: [{ message: { content: JSON.stringify(extractReply) } }] });
+  }
+  if (prompt.startsWith('fixture-merge')) {
+    memoryCalls.push('merge');
+    return Response.json({ choices: [{ message: { content: JSON.stringify(mergeReply(prompt)) } }] });
+  }
+  return Response.json({ choices: [{ message: { content: '你好' } }] });
+};
+
+// 10.1 Memory Gate：随口一句不翻旧账，明显在接前文才查
+assert.equal(needMemory('哈哈哈哈').need, false);
+assert.equal(needMemory('好困').need, false);
+assert.equal(needMemory('吃饭了吗').need, false);
+for (const text of ['我过了', '上次那个怎么样了', '你还记得之前那个人吗', '老王是不是也干过这个']) {
+  assert.equal(needMemory(text).need, true, `应该去查记忆：${text}`);
+}
+
+// 10.2 证据强度：推断不记、第三方说法降级成事件、太不重要的不记
+const candidates = parseCandidates(JSON.stringify({ memories: [
+  { target: 'profile', subject: '张三', subject_id: '10001', type: 'state', content: '在准备考公', evidence: 'self_statement', importance: 0.8, confidence: 0.9 },
+  { target: 'profile', subject: '张三', subject_id: '10001', type: 'interest', content: '天天打原神', evidence: 'third_party_claim', importance: 0.6, confidence: 0.6 },
+  { target: 'profile', subject: '张三', subject_id: '10001', type: 'state', content: '可能想跳槽', evidence: 'inference', importance: 0.9, confidence: 0.9 },
+  { target: 'event', subject: '张三', subject_id: '10001', type: 'event', content: '打了个哈欠', evidence: 'observed_event', importance: 0.1, confidence: 0.5 },
+  { target: 'profile', subject: '某人', subject_id: '', type: 'identity', content: '没有 QQ 号', evidence: 'self_statement', importance: 0.8, confidence: 0.9 },
+] }));
+assert.equal(candidates.length, 4, '没有 QQ 号的画像要丢掉');
+const ruled = applyEvidenceRules(candidates);
+assert.equal(ruled.kept.length, 2, '只留本人陈述和降级后的第三方事件');
+assert.equal(ruled.kept.find(item => item.content === '天天打原神').target, 'event', '第三方说法不能改画像');
+assert.ok(!ruled.kept.some(item => item.evidence === 'inference'), '推断不进长期记忆');
+assert.equal(parseCandidates('```json\n{"memories":[{"target":"profile","subject":"李四","subject_id":"10002","content":"后端开发"}]}\n```').length, 1, '要能容错 Markdown 围栏');
+assert.equal(parseOps('{"ops":[{"op":"ADD","candidate":0}]}').length, 1);
+
+// 10.3 ADD：库里没有相关记忆时不再问第二个模型，直接写
+extractReply = { memories: [
+  { target: 'profile', subject: '张三', subject_id: '10001', type: 'state', content: '正在准备考公', evidence: 'self_statement', importance: 0.8, confidence: 0.9 },
+  { target: 'event', subject: '张三', subject_id: '10001', type: 'event', content: '张三说 9 月 15 日要参加字节一面', evidence: 'self_statement', importance: 0.9, confidence: 0.9 },
+] };
+memoryCalls.length = 0;
+const added = await rememberSegment({ scope: 'group:9', segment: '14:00:00 张三(10001)：我在准备考公，9 月 15 日要面字节', speakers: [{ id: '10001', name: '张三' }], sourceIds: '111,112', participants: ['10001'] });
+assert.equal(added.added, 2, '画像和事件各写一条');
+assert.deepEqual(memoryCalls, ['extract'], '没有相关记忆时不该再调合并模型');
+
+// 画像按 group + user 精确过滤，不是向量检索
+assert.equal((await listProfiles('group:9', ['10001'])).length, 1);
+assert.equal((await listProfiles('group:9', ['10001']))[0].content, '正在准备考公');
+assert.equal((await listProfiles('group:9', ['10002'])).length, 0, '别人的画像取不到');
+assert.equal((await listProfiles('group:8', ['10001'])).length, 0, '别的群取不到（会话隔离）');
+
+// 10.4 UPDATE：信息变了改写旧记忆，而不是再加一条冲突的
+extractReply = { memories: [{ target: 'profile', subject: '张三', subject_id: '10001', type: 'state', content: '不考公了，开始找后端工作', evidence: 'self_statement', importance: 0.85, confidence: 0.9 }] };
+mergeReply = prompt => {
+  const id = prompt.match(/\[([0-9a-f-]{36})\] profile/)?.[1];
+  assert.ok(id, '合并提示词里要带已有记忆的 id');
+  return { ops: [{ op: 'UPDATE', candidate: 0, existing_id: id, content: '张三当前主要方向：后端求职', confidence: 0.9 }] };
+};
+memoryCalls.length = 0;
+const updated = await rememberSegment({ scope: 'group:9', segment: '15:00:00 张三(10001)：我不考公了，开始找后端工作', speakers: [{ id: '10001', name: '张三' }], sourceIds: '120', participants: ['10001'] });
+assert.deepEqual(memoryCalls, ['extract', 'merge'], '有相关记忆时才问合并模型');
+assert.equal(updated.updated, 1);
+const afterUpdate = await listProfiles('group:9', ['10001']);
+assert.equal(afterUpdate.length, 1, '同一个人同一个方面只该有一条');
+assert.equal(afterUpdate[0].content, '张三当前主要方向：后端求职');
+
+// 10.5 IGNORE：重复的说法不再写
+extractReply = { memories: [{ target: 'profile', subject: '张三', subject_id: '10001', type: 'state', content: '在找后端工作', evidence: 'self_statement', importance: 0.7, confidence: 0.8 }] };
+mergeReply = () => ({ ops: [{ op: 'IGNORE', candidate: 0, reason: '和已有记忆重复' }] });
+const ignored = await rememberSegment({ scope: 'group:9', segment: '16:00:00 张三(10001)：还是在找后端', speakers: [{ id: '10001', name: '张三' }], sourceIds: '130', participants: ['10001'] });
+assert.equal(ignored.ignored, 1);
+assert.equal(ignored.added, 0);
+assert.equal((await listProfiles('group:9', ['10001'])).length, 1, 'IGNORE 之后不该多出记录');
+
+// 10.6 事件检索：阈值过滤 + 会话隔离
+const memoryState = await memoryStats();
+assert.equal(memoryState.ready, true, 'LanceDB 应可用');
+assert.ok(memoryState.events >= 1, '事件应已写进 LanceDB');
+const eventText = '张三说 9 月 15 日要参加字节一面';
+assert.ok((await searchEvents(toyVector(eventText), { scope: 'group:9', maxDistance: 0.01 })).length >= 1, '相同向量应命中');
+assert.equal((await searchEvents(toyVector('完全不相干的另一句话'), { scope: 'group:9', maxDistance: 0.01 })).length, 0, '阈值要挡掉不相关的');
+assert.equal((await searchEvents(toyVector(eventText), { scope: 'group:999', maxDistance: 1 })).length, 0, '别的群搜不到');
+
+// 10.7 召回：Gate 放行的查询能拿到画像，闲聊连查都不查
+const recalled = await recall({ scope: 'group:9', speakerIds: ['10001'], text: '上次那个后来怎么样了' });
+assert.ok(recalled.text?.includes('张三'), '应注入说话人的画像');
+assert.ok(recalled.text.includes('张三当前主要方向：后端求职'), '注入内容要带上画像');
+assert.equal(recalled.profiles, 1);
+const skipped = await recall({ scope: 'group:9', speakerIds: ['10001'], text: '哈哈哈哈' });
+assert.equal(skipped.text, undefined);
+assert.ok(skipped.reason.includes('Gate 跳过'));
+
+// 10.8 注入是这一轮的系统背景，不写进会话存档
+const memorySession = openSession('private:77');
+memorySession.user('小明', '在吗');
+const injected = [];
+for await (const event of chatLoop(memorySession, { memory: recalled.text })) if (event.type === 'model.started') injected.push(event);
+assert.ok(injected[0].messages.some(message => message.role === 'system' && message.content.includes('张三当前主要方向')), '记忆要作为 system 消息注入');
+assert.ok(!memorySession.messages.some(message => message.content.includes('张三当前主要方向')), '记忆不能写进会话存档');
+
+// 10.9 段落组装：机器人没参与的话题也要进提取范围，说话人和消息 ID 要能对上
+const segmentInput = buildRememberInput('group:9', [
+  '14:00:00 小明(10002)：国庆去青岛吧',
+  '14:00:20 小红(10003)：行',
+  '我：带上我',
+], [{ mid: 900, uid: '10002', name: '小明' }, { mid: 901, uid: '10003', name: '小红' }, { mid: 902, uid: '10002', name: '小明' }], 12);
+assert.ok(segmentInput.segment.includes('国庆去青岛'), '没被回复过的话题也要在段落里');
+assert.ok(segmentInput.segment.includes('我：带上我'), '机器人自己的话也要带上');
+assert.deepEqual(segmentInput.speakers, [{ id: '10002', name: '小明' }, { id: '10003', name: '小红' }], '说话人按 QQ 号去重');
+assert.equal(segmentInput.sourceIds, '900,901,902', '消息 ID 用于追溯');
+assert.equal(buildRememberInput('group:9', ['1', '2', '3'], [], 2).segment, '2\n3', '只取最近几条');
+
+// 10.10 真实提示词文件：占位符不能被改没了
+for (const [file, placeholders] of [
+  ['prompts/memory-extract.txt', ['{{scope}}', '{{speakers}}', '{{segment}}']],
+  ['prompts/memory-merge.txt', ['{{existing}}', '{{candidates}}']],
+  ['prompts/memory-inject.txt', ['{{profiles}}', '{{events}}']],
+]) {
+  const text = readFileSync(file, 'utf8');
+  for (const placeholder of placeholders) assert.ok(text.includes(placeholder), `${file} 要保留 ${placeholder}`);
+}
+
+console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级/混合批次按整批判断)、长期记忆(Gate/证据强度/ADD/UPDATE/IGNORE/精确过滤/阈值/注入隔离)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');

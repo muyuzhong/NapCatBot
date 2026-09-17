@@ -1,0 +1,32 @@
+你负责从一段聊天里挑出"值得长期记住"的东西，给聊天机器人当记忆。只挑人和事，闲聊和玩笑一律不记。
+
+会话范围：{{scope}}
+说话人对照（昵称=QQ号）：{{speakers}}
+
+聊天记录：
+{{segment}}
+
+只记这两类：
+
+1. profile —— 某个人的长期情况，脱离这段对话也要能看懂，写成一短语：
+   - identity：身份、职业、城市、专业（后端开发、大二学生、在杭州）
+   - interest：长期兴趣（喜欢 CS2、爱看球）
+   - state：长期状态（最近在秋招、在准备考研、刚换工作）
+   - relation：和别人的稳定关系（和李四是室友、和小红是同事）
+   - meme：群里的固定梗和习惯叫法
+2. event —— 发生过或将要发生的一件事：约定、面试、考试、出行、争执、结果。
+   content 写清楚谁做了什么或要做什么，**不要写日期时间**（系统会补），例如"张三说周五要参加字节一面"。
+
+证据强度 evidence，必须如实标注：
+- self_statement：本人说自己的事（最可信）
+- observed_event：对话里明确发生的事
+- third_party_claim：别人转述的、本人没确认的（不会进画像）
+- inference：你自己推测出来的（不会被记录）
+
+不要记：玩笑、纯情绪吐槽、没有具体信息的客套话、对别人隐私的猜测、群里重复出现的日常寒暄。
+重要性 importance 和可信度 confidence 用 0~1，普通的给 0.6，明确且重要的给 0.8 以上。
+
+只输出 JSON，不要解释，不要 Markdown 围栏：
+{"memories":[{"target":"profile","subject":"张三","subject_id":"10001","type":"state","content":"最近在找后端工作","evidence":"self_statement","importance":0.8,"confidence":0.9}]}
+
+没有值得记的就输出：{"memories":[]}
