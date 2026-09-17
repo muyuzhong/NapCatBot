@@ -22,6 +22,7 @@ const { chatLoop, estimateSize, trimContext } = await import('./src/agent.ts');
 const { openSession } = await import('./src/store.ts');
 const { readableText } = await import('./src/napcat.ts');
 const { batchDefaults, createBatcher, formatBatch, sessionKey } = await import('./src/batch.ts');
+const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt } = await import('./src/decide.ts');
 
 const summaryMark = '【摘要】前面在聊测试。';
 const requests = [];
@@ -195,11 +196,61 @@ const legacyFile = join(sessionDir, `${createHash('sha1').update('group:7').dige
 appendFileSync(legacyFile, JSON.stringify({ type: 'turn', t: 1, uid: 42, text: '老记录' }) + '\n');
 assert.equal(openSession('group:7').messages[0].content, '[QQ 42] 老记录');
 
-// 8. 请求失败：用户消息已落盘，模型没有回复
+// 8. 意图识别：规则优先、Flash 只判参与、解析失败按不参与
+const tracker = createTracker();
+const base = { selfId: '2372709869', isGroup: true, text: '13:21:01 小明(1)：今天天气不错', segments: [{ type: 'text', data: { text: '今天天气不错' } }], participants: ['1'], history: [] };
+const rule = (over = {}) => ruleDecision({ ...base, ...over }, tracker, '9');
+
+// 私聊、@我、引用我 → 规则直接放行
+assert.equal(rule({ isGroup: false }).reason, '私聊');
+assert.equal(rule({ text: '13:21:01 小明(1)：@2372709869 在吗', segments: [{ type: 'at', data: { qq: '2372709869' } }] }).reason, '被@');
+// 普通群聊闲聊 → 交给 Flash（规则返回 null）
+assert.equal(rule(), null);
+
+// 机器人刚回了某人并提问，对方接着答话 → 规则放行
+tracker.sent('9', 555, '@1 你周末有空吗？', '我自己', ['1']);
+assert.equal(rule({ participants: ['1'] }).reason, '在回答我的提问');
+assert.equal(rule({ participants: ['2'] }), null, '别人说话不算回答');
+// 引用机器人那条消息 → 规则放行（消息 ID 匹配）
+assert.equal(rule({ segments: [{ type: 'reply', data: { id: 555 } }] }).reason, '引用了我');
+
+// 解析 Flash 的结构化输出
+// 只认 true / false 两个词
+assert.equal(parseJudge('true'), true);
+assert.equal(parseJudge('TRUE\n'), true);
+assert.equal(parseJudge('false'), false);
+assert.equal(parseJudge(' false '), false);
+assert.equal(parseJudge('我觉得应该回复'), null, '认不出来就不能替主 Agent 决策');
+assert.equal(parseJudge(''), null);
+assert.equal(parseJudge('truely'), null, '不能把别的词误当成 true');
+
+// Flash 判定：走独立的判断模型配置，且只输出参与与否
+const decideCalls = [];
+globalThis.fetch = async (url, options) => {
+  const body = JSON.parse(options.body);
+  decideCalls.push({ url: String(url), model: body.model, prompt: body.messages[0].content });
+  return Response.json({ choices: [{ message: { content: 'true' } }] });
+};
+process.env.LLM_DECIDE_MODEL = 'mock-flash';
+process.env.LLM_DECIDE_URL = 'https://flash.invalid/v1';
+const decided = await shouldReply({ ...base, history: [{ me: false, prefix: '小明(1)', text: '这机器人谁写的' }] }, createTracker(), '9');
+assert.equal(decided.reply, true);
+assert.equal(decided.source, 'flash');
+assert.equal(decideCalls[0].model, 'mock-flash', '应调用判断模型而不是主模型');
+assert.ok(decideCalls[0].prompt.includes('最近的群聊'), '判断提示词应带上最近群聊');
+assert.ok(decideCalls[0].prompt.includes('小明(1)：这机器人谁写的'), '应带上历史发言人');
+assert.ok(decideCalls[0].prompt.includes('只输出一个词'), '应要求只输出一个词');
+// 判断模型挂了 → 不参与，不能卡住
+globalThis.fetch = async () => new Response('boom', { status: 500 });
+const failed = await shouldReply(base, createTracker(), '9');
+assert.equal(failed.reply, false);
+assert.ok(failed.reason.includes('判断失败'));
+
+// 9. 请求失败：用户消息已落盘，模型没有回复
 const failing = openSession('private:2');
 globalThis.fetch = async () => new Response('mock error', { status: 500 });
 failing.user('小明(2)', 'fail');
 await assert.rejects(async () => { for await (const event of chatLoop(failing)) {} }, /HTTP 500/);
 assert.equal(failing.messages.length, 1);
 
-console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
+console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
