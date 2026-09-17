@@ -10,21 +10,42 @@ export type QQEvent = {
 };
 const env = process.env;
 let socket: WebSocket;
-const receipts = new Map<string, { socket: WebSocket; finish: (error?: Error) => void }>();
+// 同一个 echo 通道既要送发送回执，也要送查询结果，所以把整个 data 交给调用方。
+export type ApiResponse = { status?: string; retcode?: number; wording?: string; data?: any };
+const receipts = new Map<string, { socket: WebSocket; finish: (error?: Error, data?: any) => void }>();
+
+/** 通用 action 调用：只负责把 data 拿回来，业务判断交给调用方。 */
+export async function callApi(action: string, params: object = {}, timeout = 15_000): Promise<any> {
+  const ws = socket;
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('NapCat 未连接');
+  const echo = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error(`${action} 超时`)), timeout);
+    const finish = (error?: Error, data?: any) => {
+      clearTimeout(timer);
+      receipts.delete(echo);
+      error ? reject(error) : resolve(data);
+    };
+    receipts.set(echo, { socket: ws, finish });
+    try { ws.send(JSON.stringify({ action, params, echo })); }
+    catch { finish(new Error(`${action} 发送失败`)); }
+  });
+}
 
 // send() 只代表提交到连接；必须等待 echo 对应的成功回执，才算本次回复完成。
-export async function sendReply(event: QQEvent, text: string) {
+// 返回消息 ID，供"引用机器人消息"的意图判断使用。
+export async function sendReply(event: QQEvent, text: string): Promise<number | undefined> {
   const ws = socket;
   if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('NapCat 未连接');
   const echo = crypto.randomUUID();
   log( 'QQ 发送，等待回执', { echo, group: event.group_id, user: event.user_id, text });
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<number | undefined>((resolve, reject) => {
     const timer = setTimeout(() => finish(new Error('QQ 发送回执超时')), 15_000);
-    const finish = (error?: Error) => {
+    const finish = (error?: Error, data?: any) => {
       clearTimeout(timer);
       receipts.delete(echo);
-      log( error ? 'QQ 发送失败' : 'QQ 发送成功', { echo, error: error?.message });
-      error ? reject(error) : resolve();
+      log( error ? 'QQ 发送失败' : 'QQ 发送成功', { echo, error: error?.message, message_id: data?.message_id });
+      error ? reject(error) : resolve(data?.message_id);
     };
     receipts.set(echo, { socket: ws, finish });
     const group = event.message_type === 'group';
@@ -72,7 +93,7 @@ export function connect(onMessage: (event: QQEvent, text: string) => void) {
     if (event.echo) {
       log('QQ 回执', { echo: event.echo, status: event.status, retcode: event.retcode, wording: event.wording });
       const receipt = receipts.get(event.echo);
-      if (receipt?.socket === ws) receipt.finish(event.status === 'ok' ? undefined : new Error(`QQ 发送失败: ${event.retcode}`));
+      if (receipt?.socket === ws) receipt.finish(event.status === 'ok' ? undefined : new Error(`QQ 发送失败: ${event.retcode}`), event.data);
       return;
     }
     if (event.post_type !== 'message' || String(event.user_id) === String(event.self_id) || !Array.isArray(event.message)) return;
