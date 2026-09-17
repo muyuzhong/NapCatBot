@@ -46,5 +46,5 @@ async function handleMessage(event: QQEvent, text: string) {
 // ponytail: 全局串行；确需多个会话并发时再拆成会话队列。
 let pending = Promise.resolve();
 connect((event, text) => {
-  pending = pending.then(() => handleMessage(event, text));
+  pending = pending.then(() => handleMessage(event, text)).catch(error => log('处理失败', error.message));
 });

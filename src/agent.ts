@@ -14,6 +14,7 @@ const outputTokens = Number(env.LLM_MAX_OUTPUT_TOKENS || 1024);
 // 用到窗口的这个比例就开始压缩，留出输出额度和估算误差。
 const compressAt = Math.min(1, Math.max(0.1, Number(env.LLM_COMPRESS_AT || 0.8)));
 const summaryTurns = Math.max(1, Number(env.LLM_SUMMARY_TURNS || 8));
+// ponytail: 措辞暂时留在环境变量里，后续再挪到 prompts/ 文件。
 const system: Message = {
   role: 'system', content: env.AGENT_PROMPT || env.AGENT_PROMPT_1 || '你是一个中文聊天助手。',
 };
