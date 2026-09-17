@@ -1,5 +1,6 @@
 // 模型层只负责上下文和事件流，不操作 QQ。
 import type { Message, Session } from './store.ts';
+import { prompts } from './prompts.ts';
 
 export type { Message };
 export type AgentEvent =
@@ -14,10 +15,8 @@ const outputTokens = Number(env.LLM_MAX_OUTPUT_TOKENS || 1024);
 // 用到窗口的这个比例就开始压缩，留出输出额度和估算误差。
 const compressAt = Math.min(1, Math.max(0.1, Number(env.LLM_COMPRESS_AT || 0.8)));
 const summaryTurns = Math.max(1, Number(env.LLM_SUMMARY_TURNS || 8));
-// ponytail: 措辞暂时留在环境变量里，后续再挪到 prompts/ 文件。
-const system: Message = {
-  role: 'system', content: env.AGENT_PROMPT || env.AGENT_PROMPT_1 || '你是一个中文聊天助手。',
-};
+// 措辞放在 prompts/system.txt，改提示词不用动代码。
+const system = (): Message => ({ role: 'system', content: prompts.system });
 
 // ponytail: UTF-8 字节数保守估算 token；精确利用窗口时再接 tokenizer。
 export function estimateSize(messages: Message[]): number {
@@ -37,7 +36,7 @@ export function trimContext(messages: Message[], budget: number): Message[] {
 // 先按批收集要丢掉的消息、再一次性压缩，避免步长不够时反复调用模型。
 async function compress(session: Session, threshold: number, summarize: typeof summarizeHistory): Promise<void> {
   const head = () => (session.summary ? [{ role: 'system' as const, content: session.summary }] : []);
-  const size = () => estimateSize([system, ...head(), ...session.messages]);
+  const size = () => estimateSize([system(), ...head(), ...session.messages]);
   if (session.messages.length - 1 < 2 || size() <= threshold) throw new Error('消息超过上下文预算，请缩短消息或调大预算');
   const dropped: Message[] = [];
   let estimate = size();
@@ -46,7 +45,7 @@ async function compress(session: Session, threshold: number, summarize: typeof s
     const take = Math.min(session.messages.length - 1 - dropped.length, summaryTurns * 2);
     if (take < 2) break;
     dropped.push(...session.messages.slice(dropped.length, dropped.length + take));
-    estimate = estimateSize([system, ...head(), { role: 'user' as const, content: '摘'.repeat(400) }, ...session.messages.slice(dropped.length)]);
+    estimate = estimateSize([system(), ...head(), { role: "user" as const, content: "摘".repeat(400) }, ...session.messages.slice(dropped.length)]);
   }
   if (!dropped.length) throw new Error('消息超过上下文预算，请缩短消息或调大预算');
   const summary = await summarize(dropped).catch((error: any) => {
@@ -58,21 +57,17 @@ async function compress(session: Session, threshold: number, summarize: typeof s
 
 function buildMessages(session: Session): Message[] {
   return [
-    system,
+    system(),
     ...(session.summary ? [{ role: 'system' as const, content: `[前情摘要] ${session.summary}` }] : []),
     ...session.messages,
   ];
 }
 
-// 摘要调用也走同一个接口；超长记录直接截断，避免压缩本身把窗口撑爆。
+// 摘要调用也走同一个接口；措辞放在 prompts/summary.txt，超长记录直接截断避免撑爆窗口。
 async function summarizeHistory(dropped: Message[]): Promise<string | undefined> {
-  const prompt = [
-    '把下面这段较早的聊天记录压缩成一段中文摘要，供后续对话参考。',
-    '保留：说话人与其 QQ 号、承诺或约定、关键事实与结论、仍在进行的话题、语气特点。',
-    '去掉寒暄和重复；不要编造没出现过的内容；控制在 200 字以内。',
-    '',
-    dropped.map(m => `${m.role === 'user' ? '对方' : '我'}：${m.content.slice(0, 2000)}`).join('\n'),
-  ].join('\n');
+  const prompt = prompts.summary({
+    history: dropped.map(m => `${m.role === 'user' ? '对方' : '我'}：${m.content.slice(0, 2000)}`).join('\n'),
+  });
   const response = await fetch(`${env.LLM_BASE_URL!.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.LLM_API_KEY}`, 'Content-Type': 'application/json' },
@@ -101,7 +96,7 @@ export async function* chatLoop(
   if (estimateSize(buildMessages(session)) > threshold) {
     // 摘要出不来时不放弃这一轮，退回纯裁剪继续回复；裁剪也装不下才抛错。
     try { await compress(session, threshold, onCompress); }
-    catch { session.trim(trimContext([system, ...session.messages], threshold).length); }
+    catch { session.trim(trimContext([system(), ...session.messages], threshold).length); }
   }
   const messages = buildMessages(session);
   if (estimateSize(messages) > budget) throw new Error('消息超过上下文预算，请缩短消息或调大预算');

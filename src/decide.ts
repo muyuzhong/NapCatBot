@@ -1,5 +1,6 @@
 // 意图识别：先走便宜规则，模糊情况才问 Flash 要不要参与。它只做"要不要回"，不负责回答。
 import { log } from './logger.ts';
+import { prompts } from './prompts.ts';
 
 export type Decision = { reply: boolean; reason: string; source: 'rule' | 'flash' };
 export type RuleInput = {
@@ -72,32 +73,12 @@ export function ruleDecision(input: RuleInput, tracker: Tracker, chatKey: string
   return null;
 }
 
-// ponytail: 判断用的措辞暂时内建，后续再挪到 prompts/ 文件。
-const decidePrompt = [
-  '你是一个混在群里的普通群友，不是客服也不是机器人。现在轮到你决定要不要开口说话。',
-  '',
-  '说话的原则，跟真人在群里一样：',
-  '- 别人问到你了、点到你了、在跟你说话 → 说话。',
-  '- 话题你正好有看法、能接一句、能凑个热闹 → 说话。闲聊、吐槽、聊吃聊玩聊游戏聊工作，都可以搭话。',
-  '- 别人俩正在一对一地聊他们自己的事（约时间、交接事情、说私事），你插进去很突兀 → 不说话。',
-  '- 完全看不懂在说什么、话题跟你无关、纯表情或刷屏 → 不说话。',
-  '- 不确定的时候，偏向说话；太沉默的人在群里像死人。',
-  '',
-  '最近的群聊：',
-  '{{history}}',
-  '',
-  '当前这批消息：',
-  '{{messages}}',
-  '',
-  '只输出一个词：true（说话）或 false（不说话）。不要输出别的任何内容。',
-].join('\n');
-
-/** 给判断模型的请求：只回答参与与否。 */
+/** 给 Flash 的判断请求：只回答参与与否，附带一句理由。措辞在 prompts/decide.txt。 */
 export function buildJudgePrompt(input: RuleInput): string {
   const history = input.history.slice(-historySize)
     .map(m => `${m.me ? '我自己' : m.prefix}：${m.text.replace(/\n/g, ' / ')}`)
     .join('\n');
-  return decidePrompt.replace('{{history}}', history || '（无）').replace('{{messages}}', input.text);
+  return prompts.decide({ history: history || '（无）', messages: input.text });
 }
 
 /** 解析判断结果：模型只回一个 true / false。认不出来返回 null，由上层按不参与处理。 */
