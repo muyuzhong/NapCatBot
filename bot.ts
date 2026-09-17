@@ -1,8 +1,8 @@
 import { openSession } from './src/store.ts';
 import { chatLoop } from './src/agent.ts';
 import { connect, sendReply, type QQEvent } from './src/napcat.ts';
-import { createBatcher, formatBatch, sessionKey, type BatchMessage } from './src/batch.ts';
-import { createTracker, shouldReply } from './src/decide.ts';
+import { createBatcher, sessionKey, type BatchMessage } from './src/batch.ts';
+import { batchRuleInput, createTracker, shouldReply } from './src/decide.ts';
 import { log } from './src/logger.ts';
 
 // 单 Agent；入口负责会话隔离、消息聚合、意图识别、串行调度和消费模型事件。
@@ -38,19 +38,13 @@ async function handleBatch(key: string, batch: BatchMessage[]) {
   const event = latest.get(key);
   if (!event) return;
   const session = sessionOf(key);
-  const text = formatBatch(batch);
   const chatKey = String(event.message_type === 'group' ? event.group_id : event.user_id);
-  const participants = [...new Set(batch.map(m => m.uid))];
+  // 规则看整批（任意一行的 @ / 引用都算），回复仍然发到最后一条事件上。
+  const input = batchRuleInput(event, batch, recentHistory(key));
+  const text = input.text;
   batcher.busy(key);
   try {
-    const decision = await shouldReply({
-      selfId: String(event.self_id),
-      isGroup: event.message_type === 'group',
-      text,
-      segments: event.message ?? [],
-      participants,
-      history: recentHistory(key),
-    }, tracker, chatKey);
+    const decision = await shouldReply(input, tracker, chatKey);
 
     if (!decision.reply) {
       log('不参与', { key, reason: decision.reason, source: decision.source });
@@ -74,7 +68,7 @@ async function handleBatch(key: string, batch: BatchMessage[]) {
       session.reply(result.value.reply);
       // 记下"我说过什么、对谁说的"，用于后续的引用与追问判断。
       const mentioned = [...result.value.reply.matchAll(/@(\d{5,})/g)].map(m => m[1]);
-      tracker.sent(chatKey, messageId, result.value.reply, '我自己', mentioned.length ? mentioned : participants);
+      tracker.sent(chatKey, messageId, result.value.reply, '我自己', mentioned.length ? mentioned : input.participants);
     }
   } catch (error: any) {
     log('聊天失败', error.message);
@@ -101,7 +95,7 @@ async function handleMessage(event: QQEvent, text: string) {
   const name = event.sender?.card?.trim() || event.sender?.nickname?.trim() || '';
   const prefix = group ? `${name || '未知'}(${event.user_id})` : (name || String(event.user_id));
   latest.set(key, event);
-  batcher.push(key, { prefix, text, uid: String(event.user_id) });
+  batcher.push(key, { prefix, text, uid: String(event.user_id), segments: event.message ?? [] });
 }
 
 connect((event, text) => {

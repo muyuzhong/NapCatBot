@@ -2,10 +2,12 @@
 // 两条规则：新消息把定时器往后推（debounce），但总等待不超过 maxWaitMs，防止一直发导致永不处理。
 // 处理期间（意图判断 + 模型请求）仍然收消息：它们并入同一批，等本次处理结束后再补发一次，
 // 否则"人还在打字，前一条已经送去判断了"会把一句话拆成两次回复。
-export type BatchMessage = { t: number; prefix: string; text: string; uid: string };
+// segments 保留原始消息段：一批里可能有好几个人、好几条消息，
+// 判断"有没有引用我"必须能看到每一行，而不是只有最后一行。
+export type BatchMessage = { t: number; prefix: string; text: string; uid: string; segments: { type: string; data?: Record<string, any> }[] };
 
 export type Batcher = {
-  push(key: string, message: { prefix: string; text: string; uid: string; t?: number }): void;
+  push(key: string, message: { prefix: string; text: string; uid: string; segments?: { type: string; data?: Record<string, any> }[]; t?: number }): void;
   /** 标记该会话正在处理；处理期间 push 的消息会攒着，done 时再冲一次。 */
   busy(key: string): void;
   done(key: string): void;
@@ -74,7 +76,7 @@ export function createBatcher(
     push(key, message) {
       const at = message.t ?? now();
       const buffer = bufferOf(key);
-      buffer.items.push({ t: at, prefix: message.prefix, text: message.text, uid: message.uid });
+      buffer.items.push({ t: at, prefix: message.prefix, text: message.text, uid: message.uid, segments: message.segments ?? [] });
       clearTimer(buffer.timer);
       // 正在处理就攒着，由 done() 负责补发；否则按窗口/上限决定何时冲。
       if (buffer.flying) return;
@@ -100,4 +102,9 @@ export function formatBatch(batch: BatchMessage[]): string {
     const d = new Date(t);
     return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${prefix}：${text}`;
   }).join('\n');
+}
+
+/** 把整批的原始消息段摊平，供意图规则逐行判断（@我、引用我可能出现在任意一行）。 */
+export function batchSegments(batch: BatchMessage[]): { type: string; data?: Record<string, any> }[] {
+  return batch.flatMap(({ segments }) => segments);
 }

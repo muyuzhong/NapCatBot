@@ -28,7 +28,7 @@ const { openSession } = await import('./src/store.ts');
 const { readableText } = await import('./src/napcat.ts');
 const { batchDefaults, createBatcher, formatBatch, sessionKey } = await import('./src/batch.ts');
 const { prompts } = await import('./src/prompts.ts');
-const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt } = await import('./src/decide.ts');
+const { createTracker, ruleDecision, parseJudge, shouldReply, buildJudgePrompt, batchRuleInput } = await import('./src/decide.ts');
 
 const summaryMark = '【摘要】前面在聊测试。';
 const requests = [];
@@ -252,6 +252,46 @@ const failed = await shouldReply(base, createTracker(), '9');
 assert.equal(failed.reply, false);
 assert.ok(failed.reason.includes('判断失败'));
 
+// 8.5 混合批次：一批里好几个人说话，规则按整批判断，而不是只看触发事件（最新那条）
+const mixed = [
+  { t: 1, prefix: '小刚(3)', text: '[引用]在吗', uid: '3', segments: [{ type: 'reply', data: { id: 555 } }, { type: 'text', data: { text: '在吗' } }] },
+  { t: 2, prefix: '小明(1)', text: '晚上七点老地方', uid: '1', segments: [{ type: 'text', data: { text: '晚上七点老地方' } }] },
+  { t: 3, prefix: '小红(2)', text: '行', uid: '2', segments: [{ type: 'text', data: { text: '行' } }] },
+];
+// 触发事件取最后一条（闲聊），引用在最前面那条 —— 正是"只看最后一条"会漏掉的形状
+const groupEvent = { self_id: 2372709869, message_type: 'group', group_id: 9, user_id: 2, message: mixed.at(-1).segments };
+const mixedInput = batchRuleInput(groupEvent, mixed, []);
+assert.equal(mixedInput.text, formatBatch(mixed), '上下文里每行仍要带时间和发言人');
+assert.deepEqual(mixedInput.participants, ['3', '1', '2'], '发言人取整批去重');
+assert.equal(ruleDecision(mixedInput, tracker, '9')?.reason, '引用了我', '引用出现在批内任意一行都要认出来');
+assert.equal(groupEvent.message.some(s => s.type === 'reply'), false, '触发事件本身没有引用 —— 只看它就会漏');
+
+// 引用的不是机器人那条 → 不按"引用了我"放行，落回 Flash
+const otherQuote = { ...groupEvent, message: [] };
+const quoted999 = batchRuleInput(otherQuote, [{ ...mixed[0], segments: [{ type: 'reply', data: { id: 999 } }] }], []);
+assert.equal(ruleDecision(quoted999, tracker, '9'), null, '引用别人的消息不算在跟我说话');
+// 多行引用里只要有一条指向机器人就算（不能只看第一条引用）
+const twoQuotes = batchRuleInput(groupEvent, [
+  { ...mixed[0], segments: [{ type: 'reply', data: { id: 999 } }] },
+  mixed[0],
+], []);
+assert.equal(ruleDecision(twoQuotes, tracker, '9')?.reason, '引用了我', '多行引用要逐条比对');
+
+// 经聚合器走一遍：消息段要一路保留到判断层，不能被攒批丢掉
+const carried = [];
+const capture = createBatcher((_key, items) => carried.push(...items));
+capture.push('group:9', { prefix: '小刚(3)', text: '[引用]在吗', uid: '3', segments: [{ type: 'reply', data: { id: 555 } }] });
+capture.push('group:9', { prefix: '小明(1)', text: '哈哈哈哈', uid: '1', segments: [{ type: 'text', data: { text: '哈哈哈哈' } }] });
+capture.busy('group:9');
+capture.done('group:9');
+assert.equal(carried.length, 2, '聚合器应把两条消息并成一批');
+assert.equal(ruleDecision(batchRuleInput(groupEvent, carried, []), tracker, '9')?.reason, '引用了我', '经聚合器之后仍要认出第一行的引用');
+
+// 8.6 真实提示词文件：混合批次按"有一条值得接就说话"处理
+const realDecide = readFileSync('prompts/decide.txt', 'utf8');
+assert.ok(realDecide.includes('{{history}}') && realDecide.includes('{{messages}}'), '真实提示词要保留两个占位符');
+assert.ok(/一条[\s\S]{0,20}值得/.test(realDecide), '要写明这批里有一条值得接就说话');
+
 // 9. 请求失败：用户消息已落盘，模型没有回复
 const failing = openSession('private:2');
 globalThis.fetch = async () => new Response('mock error', { status: 500 });
@@ -259,4 +299,4 @@ failing.user('小明(2)', 'fail');
 await assert.rejects(async () => { for await (const event of chatLoop(failing)) {} }, /HTTP 500/);
 assert.equal(failing.messages.length, 1);
 
-console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
+console.log('检查通过：事件顺序、消息段转换(@/图片/表情)、消息聚合(debounce/最长等待/批量上限/处理中续批)、意图识别(规则/判断模型/降级/混合批次按整批判断)、发言人标注、80% 阈值压缩、摘要落盘与重启恢复、旧存档兼容、请求失败。');
